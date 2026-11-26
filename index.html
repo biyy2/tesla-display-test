@@ -38,6 +38,20 @@
     <section id="view-tesla" class="view hidden">
       <div class="status-row" id="tesla-pair-status">대기 중</div>
 
+      <section id="tesla-photo" class="card photo-card hidden" aria-label="사진으로 남길 요약">
+        <h2>사진으로 남길 요약</h2>
+        <p class="photo-lead">페어링이 되지 않았습니다. 이 칸을 휴대폰으로 찍으세요.</p>
+        <div id="tesla-photo-body"></div>
+      </section>
+
+      <section class="card" id="tesla-send-card">
+        <h2>결과를 PC로</h2>
+        <p class="hint" id="send-results-hint">연결되면 전체 결과가 자동으로 PC에 전달됩니다. 화면 공유나 탭 뒤에는 이 버튼으로 최신 결과를 다시 보내세요.</p>
+        <div class="actions">
+          <button type="button" class="btn btn-primary btn-xl" id="btn-send-results" disabled>PC로 결과 보내기</button>
+        </div>
+      </section>
+
       <section class="card">
         <h2>1. 환경</h2>
         <dl id="env-list" class="kv"></dl>
@@ -138,11 +152,19 @@
         <p id="pc-tap-readout" class="mono">아직 탭 없음</p>
       </section>
 
+      <section class="card" id="pc-tesla-card">
+        <h2>테슬라 결과</h2>
+        <p class="hint" id="pc-tesla-hint">아직 테슬라 결과가 없습니다.</p>
+        <dl id="pc-tesla-list" class="kv"></dl>
+        <pre id="pc-tesla-json" class="log hidden"></pre>
+      </section>
+
       <section class="card">
         <h2>로그</h2>
         <pre id="pc-log" class="log"></pre>
         <div class="actions">
           <button type="button" class="btn btn-primary" id="btn-copy-pc">결과 JSON 복사</button>
+          <button type="button" class="btn" id="btn-download-pc">JSON 파일로 저장</button>
         </div>
         <textarea id="pc-json" class="json-box" readonly rows="8" aria-label="결과 JSON"></textarea>
       </section>
