@@ -85,7 +85,12 @@
 
       <section class="card">
         <h2>5. PC와 페어링</h2>
-        <p class="hint">노트북에 표시된 6자리 코드를 입력하세요.</p>
+        <p class="hint" id="tesla-mode-hint">노트북에 표시된 6자리 코드를 입력하세요. PC가 연결을 시작하고, 거기서 고른 방식과 TURN 정보를 시그널링으로 받아 같은 설정을 씁니다.</p>
+        <div class="mode-row" role="group" aria-label="ICE 모드">
+          <button type="button" class="btn mode-btn" data-mode="auto" id="tesla-mode-auto">자동</button>
+          <button type="button" class="btn mode-btn" data-mode="relay" id="tesla-mode-relay">중계만</button>
+          <button type="button" class="btn mode-btn" data-mode="direct" id="tesla-mode-direct">직접만</button>
+        </div>
         <label class="lbl" for="join-code">페어링 코드</label>
         <input id="join-code" class="input code-input" type="text" maxlength="8" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="AB12CD">
         <div class="actions">
@@ -125,6 +130,28 @@
         <div class="actions">
           <button type="button" class="btn" id="btn-new-code">코드 다시 만들기</button>
         </div>
+      </section>
+
+      <section class="card" id="pc-ice-card">
+        <h2>연결 방식</h2>
+        <p class="hint">자동은 host·srflx·relay를 모두 씁니다. 중계만은 <code>iceTransportPolicy: relay</code> 입니다. 직접만은 TURN을 넣지 않습니다. 테슬라는 이 설정을 받아 같은 값으로 연결합니다.</p>
+        <div class="mode-row" role="group" aria-label="ICE 모드">
+          <button type="button" class="btn mode-btn" data-mode="auto" id="pc-mode-auto">자동</button>
+          <button type="button" class="btn mode-btn" data-mode="relay" id="pc-mode-relay">중계만</button>
+          <button type="button" class="btn mode-btn" data-mode="direct" id="pc-mode-direct">직접만</button>
+        </div>
+        <label class="lbl" for="turn-urls">TURN URL</label>
+        <textarea id="turn-urls" class="input turn-input" rows="3" spellcheck="false" placeholder="turns:example.com:443?transport=tcp&#10;turn:example.com:3478?transport=udp&#10;turn:example.com:3478?transport=tcp"></textarea>
+        <label class="lbl" for="turn-user">TURN 사용자 이름</label>
+        <input id="turn-user" class="input turn-input" type="text" autocomplete="off" spellcheck="false">
+        <label class="lbl" for="turn-cred">TURN 비밀번호</label>
+        <input id="turn-cred" class="input turn-input" type="password" autocomplete="off">
+        <div class="actions">
+          <button type="button" class="btn" id="btn-save-turn">TURN 저장</button>
+          <button type="button" class="btn btn-primary" id="btn-turn-check">TURN 서버 확인</button>
+        </div>
+        <p class="hint" id="turn-check-result">아직 확인하지 않았습니다. 자격 증명은 이 브라우저에만 저장되고 저장소에는 들어가지 않습니다.</p>
+        <dl id="turn-check-list" class="kv"></dl>
       </section>
 
       <section class="card">

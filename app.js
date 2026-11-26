@@ -12,6 +12,15 @@
     debug: 1
   };
   var ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
+  var ICE_MODE_LABEL = { auto: "자동", relay: "중계만", direct: "직접만" };
+  var iceState = { mode: "auto", turnUrls: "", turnUser: "", turnCred: "" };
+  var currentPcCode = "";
+  var reconnectTimer = { pc: null, tesla: null };
+  var reconnectWait = { pc: 500, tesla: 500 };
+  var iceOfferTimer = null;
+  var iceOfferConn = null;
+  var probeNoteAt = 0;
+  var teslaIdRetries = 0;
   var PEER_PREFIX = "parkdesk-";
   var CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   var PING_COUNT = 30;
@@ -32,8 +41,12 @@
       port: BROKER.port,
       path: BROKER.path,
       library: "peerjs@1.5.4 (vendored)",
-      note: "계정 없이 쓰는 공개 시그널링 브로커입니다. 가용성은 제3자 서비스에 달려 있습니다. TURN은 포함하지 않습니다."
+      note: "계정 없이 쓰는 공개 시그널링 브로커입니다. 가용성은 제3자 서비스에 달려 있습니다."
     },
+    iceConfig: null,
+    iceTimeline: [],
+    iceSelected: null,
+    turnCheck: null,
     ua: navigator.userAgent,
     env: {},
     support: {},
@@ -210,15 +223,17 @@
     return info;
   }
 
-  function gatherIce(logId) {
+  function gatherIce(logId, rtcConfig, store) {
+    if (store === undefined) store = true;
     return new Promise(function (resolve) {
       if (typeof RTCPeerConnection !== "function") {
-        var empty = { error: "RTCPeerConnection 없음", candidates: [], types: {}, ranges: {} };
-        results.iceGathering = empty;
+        var empty = { error: "RTCPeerConnection 없음", candidates: [], types: {}, ranges: {}, errors: [] };
+        if (store) results.iceGathering = empty;
         resolve(empty);
         return;
       }
-      var pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+      var pc = new RTCPeerConnection(rtcConfig || { iceServers: ICE_SERVERS });
+      var iceErrors = [];
       var candidates = [];
       var done = false;
 
@@ -241,9 +256,10 @@
           hasMdns: candidates.some(function (c) { return c.address.endsWith(".local") || c.typ.indexOf("mDNS") >= 0; }),
           hasSrflx: candidates.some(function (c) { return c.typ === "srflx"; }),
           hasRelay: candidates.some(function (c) { return c.typ === "relay"; }),
-          candidates: candidates
+          candidates: candidates,
+          errors: iceErrors.slice()
         };
-        results.iceGathering = out;
+        if (store) results.iceGathering = out;
         resolve(out);
       }
 
@@ -261,7 +277,9 @@
         if (pc.iceGatheringState === "complete") finish();
       };
       pc.onicecandidateerror = function (ev) {
-        if (logId) log(logId, "ICE error " + (ev.errorText || ev.errorCode || ev.url || ""));
+        var line = [ev.errorCode, ev.errorText, ev.url].filter(function (x) { return x !== undefined && x !== null && x !== ""; }).join(" ");
+        if (line) iceErrors.push(line);
+        if (logId) log(logId, "ICE error " + (line || ev.errorText || ev.errorCode || ev.url || ""));
       };
 
       try {
@@ -269,11 +287,11 @@
         pc.createOffer().then(function (offer) {
           return pc.setLocalDescription(offer);
         }).catch(function (err) {
-          results.iceGathering = { error: String(err), candidates: [] };
+          if (store) results.iceGathering = { error: String(err), candidates: [], errors: iceErrors.slice() };
           finish();
         });
       } catch (err) {
-        results.iceGathering = { error: String(err), candidates: [] };
+        if (store) results.iceGathering = { error: String(err), candidates: [], errors: iceErrors.slice() };
         finish();
       }
       setTimeout(finish, 8000);
@@ -421,17 +439,319 @@
     return PEER_PREFIX + code.toUpperCase().replace(/[^A-Z0-9]/g, "");
   }
 
+  function parseTurnUrls(text) {
+    return String(text || "").split(/[\s,]+/).map(function (s) { return s.trim(); }).filter(Boolean);
+  }
+
+  function customTurnServer() {
+    var urls = parseTurnUrls(iceState.turnUrls);
+    if (!urls.length) return null;
+    var server = { urls: urls.length === 1 ? urls[0] : urls };
+    if (iceState.turnUser) server.username = iceState.turnUser;
+    if (iceState.turnCred) server.credential = iceState.turnCred;
+    return server;
+  }
+
+  function iceServersForMode(mode) {
+    var list = [{ urls: "stun:stun.l.google.com:19302" }];
+    if (mode === "direct") return list;
+    var turn = customTurnServer();
+    if (turn) list.push(turn);
+    return list;
+  }
+
+  function rtcConfigForMode(mode) {
+    var cfg = { iceServers: iceServersForMode(mode), sdpSemantics: "unified-plan" };
+    if (mode === "relay") cfg.iceTransportPolicy = "relay";
+    return cfg;
+  }
+
+  function redactedIceConfig(mode) {
+    return {
+      mode: mode,
+      label: ICE_MODE_LABEL[mode] || mode,
+      iceTransportPolicy: mode === "relay" ? "relay" : "all",
+      hasTurn: !!(mode !== "direct" && customTurnServer()),
+      iceServers: iceServersForMode(mode).map(function (s) {
+        var copy = { urls: s.urls };
+        if (s.username) copy.username = s.username;
+        if (s.credential) copy.credential = "(입력됨)";
+        return copy;
+      })
+    };
+  }
+
+  function exportIceMetadata() {
+    return {
+      t: "ice-config",
+      mode: iceState.mode,
+      turnUrls: iceState.turnUrls,
+      turnUser: iceState.turnUser,
+      turnCred: iceState.turnCred
+    };
+  }
+
+  function applyIceMetadata(meta) {
+    if (!meta || meta.t !== "ice-config") return false;
+    if (meta.mode === "auto" || meta.mode === "relay" || meta.mode === "direct") iceState.mode = meta.mode;
+    iceState.turnUrls = meta.turnUrls || "";
+    iceState.turnUser = meta.turnUser || "";
+    iceState.turnCred = meta.turnCred || "";
+    results.iceConfig = redactedIceConfig(iceState.mode);
+    syncModeUi();
+    return true;
+  }
+
+  function syncModeUi() {
+    var buttons = document.querySelectorAll(".mode-btn");
+    for (var i = 0; i < buttons.length; i++) {
+      var on = buttons[i].getAttribute("data-mode") === iceState.mode;
+      buttons[i].classList.toggle("is-on", on);
+      buttons[i].setAttribute("aria-pressed", on ? "true" : "false");
+    }
+  }
+
+  function loadIceFromStorage() {
+    try {
+      var mode = localStorage.getItem("parkdesk.iceMode");
+      if (mode === "auto" || mode === "relay" || mode === "direct") iceState.mode = mode;
+      iceState.turnUrls = localStorage.getItem("parkdesk.turn.urls") || "";
+      iceState.turnUser = localStorage.getItem("parkdesk.turn.username") || "";
+      iceState.turnCred = localStorage.getItem("parkdesk.turn.credential") || "";
+    } catch (e) {}
+  }
+
+  function saveIceToStorage() {
+    try {
+      localStorage.setItem("parkdesk.iceMode", iceState.mode);
+      localStorage.setItem("parkdesk.turn.urls", iceState.turnUrls);
+      localStorage.setItem("parkdesk.turn.username", iceState.turnUser);
+      localStorage.setItem("parkdesk.turn.credential", iceState.turnCred);
+    } catch (e) {}
+  }
+
+  function readTurnForm() {
+    var urls = $("turn-urls");
+    var user = $("turn-user");
+    var cred = $("turn-cred");
+    if (urls) iceState.turnUrls = urls.value || "";
+    if (user) iceState.turnUser = user.value || "";
+    if (cred) iceState.turnCred = cred.value || "";
+  }
+
+  function fillTurnForm() {
+    var urls = $("turn-urls");
+    var user = $("turn-user");
+    var cred = $("turn-cred");
+    if (urls) urls.value = iceState.turnUrls;
+    if (user) user.value = iceState.turnUser;
+    if (cred) cred.value = iceState.turnCred;
+  }
+
   function peerOptions(id) {
     var opts = {
       host: BROKER.host,
       port: BROKER.port,
       path: BROKER.path,
       secure: BROKER.secure,
-      debug: BROKER.debug,
-      config: { iceServers: ICE_SERVERS }
+      debug: 0,
+      config: rtcConfigForMode(iceState.mode)
     };
     if (id) return new Peer(id, opts);
     return new Peer(opts);
+  }
+
+  function installIceConfigHook(peer) {
+    var sock = peer && peer.socket;
+    if (!sock || typeof sock.listeners !== "function" || typeof sock.removeAllListeners !== "function" || typeof sock.on !== "function") {
+      log("tesla-log", "시그널링 소켓에 ICE 설정을 미리 적용하지 못했습니다.", "error");
+      return;
+    }
+    var prev = sock.listeners("message").slice();
+    sock.removeAllListeners("message");
+    sock.on("message", function (msg) {
+      var meta = msg && msg.payload && msg.payload.metadata;
+      if (msg && msg.type === "OFFER" && meta && meta.t === "ice-config") {
+        applyIceMetadata(meta);
+        peer.options.config = rtcConfigForMode(iceState.mode);
+        log("tesla-log", "PC ICE 설정을 적용했습니다. 모드=" + (ICE_MODE_LABEL[iceState.mode] || iceState.mode) + (customTurnServer() && iceState.mode !== "direct" ? " · TURN 있음" : " · TURN 없음"));
+      }
+    });
+    prev.forEach(function (fn) { sock.on("message", fn); });
+  }
+
+  function pushIce(entry) {
+    entry.at = nowIso();
+    results.iceTimeline.push(entry);
+    if (results.iceTimeline.length > 80) results.iceTimeline.shift();
+  }
+
+  function watchPeerConnection(pc, logId, label) {
+    if (!pc || pc.__parkdeskWatch) return;
+    pc.__parkdeskWatch = true;
+    var seen = {};
+    function note(kind, extra) {
+      var row = { kind: kind, label: label || "" };
+      if (extra) Object.keys(extra).forEach(function (k) { row[k] = extra[k]; });
+      pushIce(row);
+      var text = "ICE";
+      if (label) text += " " + label;
+      text += " " + kind;
+      if (extra && extra.state) text += " " + extra.state;
+      if (extra && extra.candidate) text += " " + extra.candidate;
+      if (extra && extra.detail) text += " " + extra.detail;
+      log(logId, text);
+    }
+    function dumpCandidates() {
+      if (!pc.getStats) return;
+      pc.getStats().then(function (report) {
+        report.forEach(function (s) {
+          if (s.type !== "local-candidate" && s.type !== "remote-candidate") return;
+          var side = s.type === "local-candidate" ? "local" : "remote";
+          var typ = s.candidateType || "";
+          var addr = s.address || s.ip || "";
+          var proto = s.protocol || "";
+          var key = side + "|" + typ + "|" + proto + "|" + addr + "|" + (s.port || "");
+          if (seen[key]) return;
+          seen[key] = true;
+          var where = addr ? (addr + " (" + classifyIp(addr) + ")") : "주소 숨김";
+          note(side + "-candidate", { candidate: typ + " " + proto + " " + where });
+        });
+      }).catch(function () {});
+    }
+    note("watch", { state: "ice=" + pc.iceConnectionState + " conn=" + (pc.connectionState || "?") });
+    pc.addEventListener("iceconnectionstatechange", function () {
+      note("iceConnectionState", { state: pc.iceConnectionState });
+      dumpCandidates();
+      if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed" || pc.iceConnectionState === "failed") {
+        logSelectedPair(pc, logId, label);
+      }
+      if (pc.iceConnectionState === "failed" && role === "tesla") {
+        showTeslaPhotoSummary("ICE failed");
+      }
+    });
+    pc.addEventListener("connectionstatechange", function () {
+      note("connectionState", { state: pc.connectionState });
+    });
+    pc.addEventListener("icecandidateerror", function (ev) {
+      note("candidate-error", { detail: [ev.errorCode, ev.errorText, ev.url].filter(Boolean).join(" ") });
+    });
+  }
+
+  function watchConn(conn, logId, label) {
+    var tries = 0;
+    function tick() {
+      var pc = peerConnectionOf(conn);
+      if (pc) { watchPeerConnection(pc, logId, label); return; }
+      if (tries++ < 30) setTimeout(tick, 100);
+    }
+    tick();
+  }
+
+  async function logSelectedPair(pc, logId, label, attempt) {
+    var st = await statsFromPc(pc);
+    var detail;
+    if (!st || (!st.local && !st.remote)) {
+      if ((attempt || 0) < 3) {
+        setTimeout(function () { logSelectedPair(pc, logId, label, (attempt || 0) + 1); }, 500);
+        return;
+      }
+      detail = "없음";
+    } else {
+      detail = (st.pairType || "?")
+        + " local=" + (st.local ? (st.local.typ + " " + (st.local.protocol || "") + " " + st.local.range) : "?")
+        + " remote=" + (st.remote ? (st.remote.typ + " " + (st.remote.protocol || "") + " " + st.remote.range) : "?")
+        + " state=" + (st.pairState || "?");
+      results.iceSelected = {
+        at: nowIso(),
+        label: label || "",
+        pairType: st.pairType,
+        pairState: st.pairState,
+        local: st.local,
+        remote: st.remote
+      };
+    }
+    pushIce({ kind: "selected-pair", label: label || "", detail: detail });
+    log(logId, "ICE 선택 쌍 " + (label ? label + " " : "") + detail);
+  }
+
+  function scheduleReconnect(which) {
+    if (reconnectTimer[which]) return;
+    var wait = reconnectWait[which] || 500;
+    reconnectWait[which] = Math.min(8000, wait * 2);
+    reconnectTimer[which] = setTimeout(function () {
+      reconnectTimer[which] = null;
+      var peer = which === "pc" ? pcPeer : teslaPeer;
+      var logId = which === "pc" ? "pc-log" : "tesla-log";
+      if (!peer || peer.destroyed) return;
+      if (!peer.disconnected) {
+        reconnectWait[which] = 500;
+        return;
+      }
+      log(logId, "브로커에 같은 ID로 재연결합니다.");
+      try {
+        peer.reconnect();
+      } catch (err) {
+        log(logId, "재연결 실패: " + err, "error");
+        scheduleReconnect(which);
+      }
+    }, wait);
+  }
+
+  function handleBrokerError(which, err) {
+    var typ = (err && err.type) || "";
+    var logId = which === "pc" ? "pc-log" : "tesla-log";
+    if (typ === "network" || typ === "socket-error" || typ === "socket-closed" || typ === "server-error" || typ === "disconnected") {
+      log(logId, "브로커 연결이 끊겼습니다 (" + typ + "). 페어링 코드는 유지하고 재연결합니다.");
+      scheduleReconnect(which);
+      return;
+    }
+    if (which === "pc" && typ === "peer-unavailable") {
+      if (pcConn && pcConn.open) return;
+      var now = Date.now();
+      if (now - probeNoteAt > 15000) {
+        probeNoteAt = now;
+        log(logId, "테슬라 쪽이 아직 없습니다. 같은 코드로 계속 기다립니다.");
+      }
+      if (iceOfferConn) {
+        var stale = iceOfferConn;
+        iceOfferConn = null;
+        try { stale.close(); } catch (e) {}
+      }
+      scheduleIceOffer(700);
+      return;
+    }
+    if (typ === "unavailable-id") {
+      if (which === "pc") {
+        var next = randomCode();
+        log(logId, "이 코드의 ID가 이미 사용 중입니다. 새 코드 " + next);
+        startPcBroker(next);
+      } else {
+        teslaIdRetries += 1;
+        if (teslaIdRetries > 8) {
+          log(logId, "테슬라 ID를 아직 다시 받지 못했습니다.", "error");
+          setStatus("tesla-pair-status", "코드가 점유되어 있습니다. 잠시 뒤 연결을 다시 누르세요.", "bad");
+          showTeslaPhotoSummary("unavailable-id");
+          return;
+        }
+        log(logId, "테슬라 ID가 잠시 사용 중입니다. 같은 코드로 다시 시도합니다.");
+        setStatus("tesla-pair-status", "코드가 잠시 점유됨. 다시 시도합니다.", "wait");
+        setTimeout(function () {
+          if (results.pairing && results.pairing.code) teslaJoin(results.pairing.code);
+        }, 2000);
+      }
+      return;
+    }
+    log(logId, "Peer 오류: " + typ + " " + err, "error");
+    if (which === "tesla") {
+      setStatus("tesla-pair-status", "연결 실패: " + (typ || err), "bad");
+      setSendResultsEnabled(false);
+      if (typ === "webrtc" || typ === "negotiation-failed" || typ === "peer-unavailable") {
+        showTeslaPhotoSummary(typ || String(err));
+      }
+    } else if (typ !== "webrtc") {
+      setStatus("pc-status", "오류: " + (typ || err), "bad");
+    }
   }
 
   function describePairType(localTyp, remoteTyp, localAddr, remoteAddr) {
@@ -767,17 +1087,37 @@
     var sup = results.support || {};
     var codecs = results.codecs || {};
     var ice = results.iceGathering || {};
+    var lastIce = "";
+    var lastConn = "";
+    var relayN = 0;
+    var hostN = 0;
+    var srflxN = 0;
+    (results.iceTimeline || []).forEach(function (ev) {
+      if (!ev) return;
+      if (ev.kind === "iceConnectionState") lastIce = ev.state || lastIce;
+      if (ev.kind === "connectionState") lastConn = ev.state || lastConn;
+      var cand = ev.candidate || "";
+      if (ev.kind === "local-candidate" || ev.kind === "remote-candidate") {
+        if (cand.indexOf("relay") === 0) relayN += 1;
+        else if (cand.indexOf("srflx") === 0 || cand.indexOf("prflx") === 0) srflxN += 1;
+        else if (cand.indexOf("host") === 0) hostN += 1;
+      }
+    });
+    var cfg = results.iceConfig;
     var lines = [
       ["실패", reason || "-"],
+      ["모드", cfg ? (cfg.label + (cfg.hasTurn ? " · TURN" : " · TURN 없음")) : (ICE_MODE_LABEL[iceState.mode] || iceState.mode)],
       ["화면", (env.screenWidth || "?") + "×" + (env.screenHeight || "?")],
       ["창", (env.innerWidth || "?") + "×" + (env.innerHeight || "?") + "  dpr " + (env.devicePixelRatio || "?")],
       ["WebRTC", sup.RTCPeerConnection ? "지원" : "없음"],
       ["Data", sup.RTCDataChannel ? "지원" : "없음"],
       ["H.264", codecs.h264 ? "있음" : "없음"],
-      ["ICE", "후보 " + (ice.candidateCount != null ? ice.candidateCount : 0)
+      ["ICE수집", "후보 " + (ice.candidateCount != null ? ice.candidateCount : 0)
         + " · host " + (ice.hasHost ? "있음" : "없음")
-        + " · srflx " + (ice.hasSrflx ? "있음" : "없음")
-        + " · mDNS " + (ice.hasMdns ? "있음" : "없음")],
+        + " · srflx " + (ice.hasSrflx ? "있음" : "없음")],
+      ["ICE연결", (lastIce || "-") + " / " + (lastConn || "-")],
+      ["쌍후보", "host " + hostN + " · srflx " + srflxN + " · relay " + relayN],
+      ["선택", (results.iceSelected && results.iceSelected.pairType) || "없음"],
       ["사설IP", summarizePrivateIp(results.privateIpTest)]
     ];
     if (results.errors && results.errors.length) {
@@ -911,24 +1251,36 @@
     hideTeslaPhotoSummary();
     setSendResultsEnabled(false);
     var target = peerIdFromCode(code);
-    results.pairing = { role: "tesla", code: code, target: target, broker: BROKER.host, startedAt: nowIso() };
+    var localId = target + "-t";
+    results.pairing = { role: "tesla", code: code, target: target, localPeerId: localId, broker: BROKER.host, startedAt: nowIso(), ice: redactedIceConfig(iceState.mode) };
+    results.iceConfig = redactedIceConfig(iceState.mode);
     setStatus("tesla-pair-status", "브로커 접속 중…", "wait");
-    log("tesla-log", "PeerJS 브로커 " + BROKER.host + " 에 연결하고 " + target + " 를 찾습니다.");
+    log("tesla-log", "PeerJS 브로커 " + BROKER.host + " 에 " + localId + " 로 등록하고 PC의 연결을 기다립니다.");
 
-    var peer = peerOptions();
+    var peer = peerOptions(localId);
     teslaPeer = peer;
+    installIceConfigHook(peer);
     peer.on("open", function (id) {
       if (teslaPeer !== peer) return;
-      log("tesla-log", "브로커에 연결됨. 내 ID=" + id);
+      teslaIdRetries = 0;
+      reconnectWait.tesla = 500;
+      log("tesla-log", "브로커에 연결됨. 내 ID=" + id + ". PC가 같은 코드로 연결하기를 기다립니다.");
       results.pairing.localPeerId = id;
-      setStatus("tesla-pair-status", "브로커 연결됨. DataChannel/ICE 대기 중…", "wait");
-      var conn = teslaPeer.connect(target, { reliable: true, metadata: { role: "tesla" } });
+      results.pairing.brokerOpen = true;
+      setStatus("tesla-pair-status", "PC의 연결을 기다리는 중", "wait");
+    });
+    peer.on("connection", function (conn) {
+      if (teslaPeer !== peer) return;
+      log("tesla-log", "PC 연결 수신: " + conn.peer);
+      hideTeslaPhotoSummary();
       wireTeslaData(conn);
+      watchConn(conn, "tesla-log", "data");
     });
     peer.on("call", function (call) {
       teslaCall = call;
       log("tesla-log", "화면 공유 수신. 응답합니다.");
       call.answer();
+      watchConn(call, "tesla-log", "media");
       call.on("stream", function (stream) {
         var video = $("tesla-video");
         video.srcObject = stream;
@@ -948,15 +1300,12 @@
     });
     peer.on("error", function (err) {
       if (teslaPeer !== peer) return;
-      var msg = (err && err.type) ? (err.type + ": " + err) : String(err);
-      log("tesla-log", "Peer 오류: " + msg, "error");
-      setStatus("tesla-pair-status", "연결 실패: " + ((err && err.type) || msg), "bad");
-      setSendResultsEnabled(false);
-      showTeslaPhotoSummary((err && err.type) ? String(err.type) : String(err));
+      handleBrokerError("tesla", err);
     });
     peer.on("disconnected", function () {
       if (teslaPeer !== peer) return;
-      log("tesla-log", "브로커와 연결이 끊겼습니다.");
+      log("tesla-log", "브로커와 끊겼습니다. 같은 ID로 재연결합니다.");
+      scheduleReconnect("tesla");
     });
 
     if (statsTimer) clearInterval(statsTimer);
@@ -1006,6 +1355,11 @@
     });
     $("btn-copy-tesla").addEventListener("click", function () {
       copyText(snapshotResults(), "tesla-json", "tesla-log");
+    });
+    bindModeButtons(function () {
+      if (teslaPeer) teslaPeer.options.config = rtcConfigForMode(iceState.mode);
+      results.iceConfig = redactedIceConfig(iceState.mode);
+      log("tesla-log", "모드를 " + (ICE_MODE_LABEL[iceState.mode] || iceState.mode) + " 로 골랐습니다. PC 설정이 오면 그 값으로 덮어씁니다.");
     });
     $("btn-send-results").addEventListener("click", function () {
       sendTeslaResults("button");
@@ -1083,9 +1437,13 @@
   }
 
   function wirePcData(conn) {
+    if (!conn || conn.__wired) return;
+    conn.__wired = true;
     pcConn = conn;
     pcRemotePeerId = conn.peer;
+    var opened = false;
     conn.on("open", function () {
+      opened = true;
       log("pc-log", "테슬라 DataChannel이 열렸습니다. peer=" + conn.peer);
       setStatus("pc-status", "테슬라와 연결됨", "ok");
       results.pairing = Object.assign(results.pairing || {}, { dataOpen: true, remotePeerId: conn.peer, connectedAt: nowIso() });
@@ -1099,8 +1457,10 @@
       if (data.t === "results") ingestTeslaResultChunk(data);
     });
     conn.on("close", function () {
+      if (pcConn === conn) pcConn = null;
+      if (!opened) return;
       log("pc-log", "DataChannel이 닫혔습니다.");
-      setStatus("pc-status", "테슬라 연결이 끊겼습니다", "bad");
+      setStatus("pc-status", "테슬라 연결이 끊겼습니다. 같은 코드로 다시 연결합니다.", "bad");
       stopPings();
     });
     conn.on("error", function (err) { log("pc-log", "DataChannel 오류: " + err, "error"); });
@@ -1163,8 +1523,121 @@
     });
   }
 
+  function scheduleIceOffer(delay) {
+    if (iceOfferTimer) clearTimeout(iceOfferTimer);
+    iceOfferTimer = setTimeout(function () {
+      iceOfferTimer = null;
+      attemptIceOffer();
+    }, delay == null ? 300 : delay);
+  }
+
+  function attemptIceOffer() {
+    if (!pcPeer || pcPeer.destroyed || pcPeer.disconnected || !pcPeer.open) return;
+    if (pcConn && pcConn.open) return;
+    if (iceOfferConn) return;
+    var code = currentPcCode;
+    if (!code) return;
+    var teslaId = peerIdFromCode(code) + "-t";
+    results.iceConfig = redactedIceConfig(iceState.mode);
+    if (pcPeer) pcPeer.options.config = rtcConfigForMode(iceState.mode);
+    log("pc-log", "테슬라 " + teslaId + " 로 연결을 시작합니다. 모드=" + (ICE_MODE_LABEL[iceState.mode] || iceState.mode) + (customTurnServer() && iceState.mode !== "direct" ? " · TURN 있음" : " · TURN 없음"));
+    var conn;
+    try {
+      conn = pcPeer.connect(teslaId, { reliable: true, metadata: exportIceMetadata() });
+    } catch (err) {
+      log("pc-log", "연결 시작 실패: " + err, "error");
+      scheduleIceOffer(1500);
+      return;
+    }
+    if (!conn) {
+      scheduleIceOffer(1500);
+      return;
+    }
+    iceOfferConn = conn;
+    watchConn(conn, "pc-log", "data");
+    wirePcData(conn);
+    setTimeout(function () {
+      if (iceOfferConn !== conn) return;
+      if (pcConn && pcConn.open) return;
+      log("pc-log", "연결이 아직 열리지 않아 같은 코드로 다시 시도합니다.");
+      iceOfferConn = null;
+      try { conn.close(); } catch (e) {}
+      scheduleIceOffer(300);
+    }, 8000);
+    conn.on("open", function () {
+      if (iceOfferConn === conn) iceOfferConn = null;
+      if (iceOfferTimer) { clearTimeout(iceOfferTimer); iceOfferTimer = null; }
+    });
+    conn.on("close", function () {
+      if (iceOfferConn === conn) iceOfferConn = null;
+      if (!(pcConn && pcConn.open)) scheduleIceOffer(800);
+    });
+    conn.on("error", function (err) {
+      log("pc-log", "DataChannel 오류: " + ((err && err.type) || err), "error");
+    });
+  }
+
+  async function checkTurnServers() {
+    readTurnForm();
+    saveIceToStorage();
+    var box = $("turn-check-result");
+    var turn = customTurnServer();
+    if (!turn) {
+      var msg = "TURN URL이 없습니다. 계정 없이 동작하는 공개 TURN은 지금 없습니다. README의 Metered 가입 절차로 URL·아이디·비밀번호를 넣은 뒤 다시 확인하세요.";
+      if (box) box.textContent = msg;
+      results.turnCheck = { at: nowIso(), ok: false, reason: "no-turn-configured" };
+      log("pc-log", msg);
+      return;
+    }
+    if (box) box.textContent = "TURN 후보를 수집하는 중…";
+    log("pc-log", "TURN 서버 확인을 시작합니다.");
+    var summary = await gatherIce("pc-log", {
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }, turn],
+      iceTransportPolicy: "all",
+      sdpSemantics: "unified-plan"
+    }, false);
+    var relay = (summary.candidates || []).filter(function (c) { return c.typ === "relay"; });
+    results.turnCheck = {
+      at: nowIso(),
+      ok: relay.length > 0,
+      candidateCount: summary.candidateCount || 0,
+      relayCount: relay.length,
+      types: summary.types || {},
+      errors: (summary.errors || []).slice(0, 8)
+    };
+    var text = relay.length
+      ? "relay 후보 " + relay.length + "개. 이 노트북에서 TURN에 도달했습니다."
+      : "relay 후보가 없습니다. URL·계정·방화벽을 확인하세요.";
+    if (box) box.textContent = text;
+    if ($("turn-check-list")) {
+      kv($("turn-check-list"), [
+        ["relay", relay.length ? (relay.length + "개") : "없음", relay.length ? "ok-text" : "bad-text"],
+        ["전체 후보", String(summary.candidateCount || 0)],
+        ["유형", JSON.stringify(summary.types || {})],
+        ["오류", (summary.errors && summary.errors.length) ? summary.errors.slice(0, 3).join(" | ") : "없음", (summary.errors && summary.errors.length) ? "warn-text" : ""]
+      ]);
+    }
+    log("pc-log", "TURN 서버 확인: " + text);
+  }
+
+  function bindModeButtons(onChange) {
+    var buttons = document.querySelectorAll(".mode-btn");
+    for (var i = 0; i < buttons.length; i++) {
+      buttons[i].addEventListener("click", function () {
+        var mode = this.getAttribute("data-mode");
+        if (mode !== "auto" && mode !== "relay" && mode !== "direct") return;
+        iceState.mode = mode;
+        syncModeUi();
+        if (onChange) onChange();
+      });
+    }
+    syncModeUi();
+  }
+
   function startPcBroker(code) {
     clearReceivedTesla();
+    if (iceOfferTimer) { clearTimeout(iceOfferTimer); iceOfferTimer = null; }
+    iceOfferConn = null;
     if (typeof Peer !== "function") {
       setStatus("pc-status", "PeerJS 로드 실패", "bad");
       log("pc-log", "window.Peer 가 없습니다.", "error");
@@ -1178,32 +1651,32 @@
     pcConn = null;
     pcCall = null;
     pcRemotePeerId = null;
+    currentPcCode = code;
     var id = peerIdFromCode(code);
-    results.pairing = { role: "pc", code: code, peerId: id, broker: BROKER.host, startedAt: nowIso() };
+    results.pairing = { role: "pc", code: code, peerId: id, broker: BROKER.host, startedAt: nowIso(), ice: redactedIceConfig(iceState.mode) };
+    results.iceConfig = redactedIceConfig(iceState.mode);
     $("pc-code").textContent = code;
     setStatus("pc-status", "브로커 연결 중…", "wait");
-    log("pc-log", "Peer ID " + id + " 로 " + BROKER.host + " 에 등록합니다.");
+    log("pc-log", "Peer ID " + id + " 로 " + BROKER.host + " 에 등록합니다. 모드=" + (ICE_MODE_LABEL[iceState.mode] || iceState.mode));
 
-    pcPeer = peerOptions(id);
-    pcPeer.on("open", function (openId) {
+    var peer = peerOptions(id);
+    pcPeer = peer;
+    peer.on("open", function (openId) {
+      if (pcPeer !== peer) return;
+      reconnectWait.pc = 500;
       log("pc-log", "브로커 등록 완료: " + openId);
-      setStatus("pc-status", "코드 대기 중 — 테슬라에서 입력하세요", "wait");
+      setStatus("pc-status", "코드 대기 중 — 테슬라에서 같은 코드를 입력하세요", "wait");
       results.pairing.brokerOpen = true;
+      scheduleIceOffer(200);
     });
-    pcPeer.on("error", function (err) {
-      var typ = err && err.type;
-      log("pc-log", "Peer 오류: " + typ + " " + err, "error");
-      if (typ === "unavailable-id") {
-        var next = randomCode();
-        log("pc-log", "코드가 이미 사용 중입니다. 새 코드 " + next);
-        startPcBroker(next);
-        return;
-      }
-      setStatus("pc-status", "브로커 오류: " + (typ || String(err)), "bad");
+    peer.on("error", function (err) {
+      if (pcPeer !== peer) return;
+      handleBrokerError("pc", err);
     });
-    pcPeer.on("disconnected", function () {
-      log("pc-log", "브로커와 끊겼습니다. 재연결을 시도합니다.");
-      try { pcPeer.reconnect(); } catch (e) {}
+    peer.on("disconnected", function () {
+      if (pcPeer !== peer) return;
+      log("pc-log", "브로커와 끊겼습니다. 같은 코드로 재연결합니다.");
+      scheduleReconnect("pc");
     });
     listenPcIncoming();
     if (statsTimer) clearInterval(statsTimer);
@@ -1236,6 +1709,7 @@
       log("pc-log", "call()이 실패했습니다.", "error");
       return;
     }
+    watchConn(pcCall, "pc-log", "media");
     results.media = { startedAt: nowIso(), direction: "out" };
     pcCall.on("close", function () { log("pc-log", "통화가 종료되었습니다."); });
     pcCall.on("error", function (err) { log("pc-log", "통화 오류: " + err, "error"); });
@@ -1263,8 +1737,38 @@
     readEnv();
     readSupport();
     readCodecs();
+    loadIceFromStorage();
+    fillTurnForm();
+    results.iceConfig = redactedIceConfig(iceState.mode);
+    syncModeUi();
     var code = randomCode();
     startPcBroker(code);
+
+    bindModeButtons(function () {
+      readTurnForm();
+      saveIceToStorage();
+      results.iceConfig = redactedIceConfig(iceState.mode);
+      if (pcPeer) pcPeer.options.config = rtcConfigForMode(iceState.mode);
+      log("pc-log", "모드를 " + (ICE_MODE_LABEL[iceState.mode] || iceState.mode) + " 로 바꿨습니다. 다음 연결부터 적용됩니다.");
+      if (iceOfferConn && !(pcConn && pcConn.open)) {
+        var stale = iceOfferConn;
+        iceOfferConn = null;
+        try { stale.close(); } catch (e) {}
+      }
+      if (!(pcConn && pcConn.open)) scheduleIceOffer(200);
+    });
+    var saveTurn = $("btn-save-turn");
+    if (saveTurn) saveTurn.addEventListener("click", function () {
+      readTurnForm();
+      saveIceToStorage();
+      results.iceConfig = redactedIceConfig(iceState.mode);
+      if (pcPeer) pcPeer.options.config = rtcConfigForMode(iceState.mode);
+      log("pc-log", "TURN 정보를 이 브라우저에 저장했습니다.");
+      var hint = $("turn-check-result");
+      if (hint && !results.turnCheck) hint.textContent = "저장했습니다. TURN 서버 확인으로 relay 후보가 나오는지 보세요.";
+    });
+    var turnBtn = $("btn-turn-check");
+    if (turnBtn) turnBtn.addEventListener("click", function () { checkTurnServers(); });
 
     $("btn-new-code").addEventListener("click", function () {
       stopShare();

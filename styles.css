@@ -249,6 +249,12 @@ video {
   font-weight: 700;
 }
 
+.mode-row { display: flex; flex-wrap: wrap; gap: 10px; margin: 8px 0 14px; }
+.mode-btn { flex: 1 1 140px; min-height: 64px; }
+.mode-btn.is-on { background: var(--accent); color: #062421; }
+.turn-input { font-size: 16px; min-height: 0; padding: 12px 14px; letter-spacing: 0; text-align: left; }
+textarea.turn-input { font-family: ui-monospace, "Cascadia Mono", monospace; }
+
 .photo-card {
   background: #f4f7fb;
   color: #12141a;
