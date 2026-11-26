@@ -1,0 +1,7 @@
+PeerJS 1.5.4 is included as peerjs.min.js for offline/static hosting reliability.
+
+PeerJS is licensed under the MIT License.
+https://github.com/peers/peerjs
+
+The test page uses the public PeerJS cloud broker at 0.peerjs.com (no account).
+That broker is a third-party service and is not part of this repository.

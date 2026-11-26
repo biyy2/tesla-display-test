@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="referrer" content="no-referrer">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%233db8a8'/%3E%3C/svg%3E">
+  <title>ParkDesk Phase 0 검사</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div id="app">
+    <header class="top">
+      <div>
+        <p class="eyebrow">ParkDesk · Phase 0</p>
+        <h1 id="page-title">테슬라 연결 검사</h1>
+      </div>
+      <p class="sub" id="page-sub">주차(P) 상태에서만 사용하세요. 주행 중에는 열지 마세요.</p>
+    </header>
+
+    <section id="view-home" class="view">
+      <p class="lead">이 기기의 역할을 고르세요. 노트북은 PC, 테슬라 화면은 테슬라를 누릅니다.</p>
+      <div class="role-grid">
+        <a class="role-card" href="?role=tesla">
+          <span class="role-kicker">차량 화면</span>
+          <span class="role-name">테슬라</span>
+          <span class="role-desc">브라우저 능력, ICE, 사설 IP 차단, 페어링 수신을 검사합니다.</span>
+        </a>
+        <a class="role-card" href="?role=pc">
+          <span class="role-kicker">노트북</span>
+          <span class="role-name">PC</span>
+          <span class="role-desc">페어링 코드를 만들고, 연결 경로(LAN 직접 / 중계)와 화면 공유를 검사합니다.</span>
+        </a>
+      </div>
+    </section>
+
+    <section id="view-tesla" class="view hidden">
+      <div class="status-row" id="tesla-pair-status">대기 중</div>
+
+      <section class="card">
+        <h2>1. 환경</h2>
+        <dl id="env-list" class="kv"></dl>
+      </section>
+
+      <section class="card">
+        <h2>2. WebRTC 지원</h2>
+        <dl id="cap-list" class="kv"></dl>
+      </section>
+
+      <section class="card">
+        <h2>3. ICE 후보 수집</h2>
+        <p class="hint">STUN만 사용합니다. 공개 TURN 서버는 넣지 않았습니다.</p>
+        <div class="actions">
+          <button type="button" class="btn" id="btn-ice">ICE 다시 수집</button>
+        </div>
+        <dl id="ice-summary" class="kv"></dl>
+        <ul id="ice-list" class="plain-list"></ul>
+      </section>
+
+      <section class="card">
+        <h2>4. 사설 IP 접속 검사</h2>
+        <p class="hint">노트북의 핫스팟 IP를 입력하세요. 예: 192.168.43.52. 이 페이지는 HTTPS라서 HTTP 주소는 혼합 콘텐츠로 막힐 수 있습니다. 차단 사유를 구분해 기록합니다.</p>
+        <label class="lbl" for="private-ip">노트북 IP</label>
+        <input id="private-ip" class="input" type="text" inputmode="decimal" autocomplete="off" placeholder="192.168.x.x" spellcheck="false">
+        <div class="actions">
+          <button type="button" class="btn" id="btn-private">사설 IP 검사</button>
+        </div>
+        <dl id="private-list" class="kv"></dl>
+      </section>
+
+      <section class="card">
+        <h2>5. PC와 페어링</h2>
+        <p class="hint">노트북에 표시된 6자리 코드를 입력하세요.</p>
+        <label class="lbl" for="join-code">페어링 코드</label>
+        <input id="join-code" class="input code-input" type="text" maxlength="8" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="AB12CD">
+        <div class="actions">
+          <button type="button" class="btn btn-primary" id="btn-join">연결</button>
+          <button type="button" class="btn btn-ghost" id="btn-leave-tesla">끊기</button>
+        </div>
+        <dl id="tesla-conn-list" class="kv"></dl>
+      </section>
+
+      <section class="card">
+        <h2>6. 화면 수신 · 터치</h2>
+        <p class="hint">영상이 보이면 화면을 탭하세요. 좌표가 PC로 전달됩니다.</p>
+        <div class="video-wrap">
+          <video id="tesla-video" autoplay playsinline muted></video>
+          <p id="tesla-video-empty" class="video-empty">아직 화면 공유가 없습니다</p>
+        </div>
+        <p id="tesla-tap-readout" class="mono"></p>
+      </section>
+
+      <section class="card">
+        <h2>로그</h2>
+        <pre id="tesla-log" class="log"></pre>
+        <div class="actions">
+          <button type="button" class="btn btn-primary" id="btn-copy-tesla">결과 JSON 복사</button>
+        </div>
+        <textarea id="tesla-json" class="json-box" readonly rows="8" aria-label="결과 JSON"></textarea>
+      </section>
+    </section>
+
+    <section id="view-pc" class="view hidden">
+      <div class="status-row" id="pc-status">브로커 연결 중…</div>
+
+      <section class="card highlight">
+        <h2>페어링 코드</h2>
+        <p class="code-xl" id="pc-code">------</p>
+        <p class="hint">테슬라 브라우저에서 이 페이지를 연 뒤, 테슬라 역할에서 코드를 입력하세요.</p>
+        <div class="actions">
+          <button type="button" class="btn" id="btn-new-code">코드 다시 만들기</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>연결 상태</h2>
+        <dl id="pc-conn-list" class="kv"></dl>
+      </section>
+
+      <section class="card">
+        <h2>DataChannel RTT</h2>
+        <dl id="pc-rtt-list" class="kv"></dl>
+      </section>
+
+      <section class="card">
+        <h2>화면 공유 (선택)</h2>
+        <p class="hint">노트북에서만 동작합니다. 공유할 창이나 화면을 고르세요.</p>
+        <div class="actions">
+          <button type="button" class="btn btn-primary" id="btn-share">화면 공유 시작</button>
+          <button type="button" class="btn btn-ghost" id="btn-stop-share">공유 중지</button>
+        </div>
+        <dl id="pc-media-list" class="kv"></dl>
+        <p class="hint">테슬라에서 탭한 좌표</p>
+        <div id="tap-board" class="tap-board" aria-label="터치 좌표">
+          <div id="tap-dot" class="tap-dot hidden"></div>
+        </div>
+        <p id="pc-tap-readout" class="mono">아직 탭 없음</p>
+      </section>
+
+      <section class="card">
+        <h2>로그</h2>
+        <pre id="pc-log" class="log"></pre>
+        <div class="actions">
+          <button type="button" class="btn btn-primary" id="btn-copy-pc">결과 JSON 복사</button>
+        </div>
+        <textarea id="pc-json" class="json-box" readonly rows="8" aria-label="결과 JSON"></textarea>
+      </section>
+    </section>
+  </div>
+
+  <script src="./peerjs.min.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
