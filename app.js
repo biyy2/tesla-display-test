@@ -60,6 +60,10 @@
   var pingPending = {};
   var pingSamples = [];
   var statsTimer = null;
+  var liveTestSnapshotSent = false;
+  var receivedTesla = null;
+  var incomingResults = null;
+  var RESULT_CHUNK_BYTES = 3500;
 
   function nowIso() {
     return new Date().toISOString();
@@ -478,6 +482,185 @@
     return JSON.stringify(results, null, 2);
   }
 
+  function utf8ByteLength(s) {
+    if (window.TextEncoder) return new TextEncoder().encode(s).length;
+    return unescape(encodeURIComponent(s)).length;
+  }
+
+  function chunkUtf8(str, maxBytes) {
+    var chunks = [];
+    var i = 0;
+    while (i < str.length) {
+      var end = Math.min(str.length, i + maxBytes);
+      while (end > i + 1 && utf8ByteLength(str.slice(i, end)) > maxBytes) {
+        end = i + Math.max(1, Math.floor((end - i) / 2));
+      }
+      if (end < str.length) {
+        var tail = str.charCodeAt(end - 1);
+        var next = str.charCodeAt(end);
+        if (tail >= 0xD800 && tail <= 0xDBFF && next >= 0xDC00 && next <= 0xDFFF) end -= 1;
+        if (end <= i) end = Math.min(str.length, i + 1);
+      }
+      chunks.push(str.slice(i, end));
+      i = end;
+    }
+    if (!chunks.length) chunks.push("");
+    return chunks;
+  }
+
+  function summarizePrivateIp(p) {
+    if (!p) return "안 함";
+    if (p.error) return (p.ip || "-") + " · " + p.error;
+    var tests = p.tests || [];
+    var ok = 0;
+    tests.forEach(function (t) { if (t && t.ok) ok++; });
+    return (p.ip || "-") + " · 성공 " + ok + "/" + tests.length;
+  }
+
+  function setSendResultsEnabled(on) {
+    var btn = $("btn-send-results");
+    if (!btn) return;
+    btn.disabled = !on;
+  }
+
+  function sendTeslaResults(reason) {
+    if (!teslaConn || !teslaConn.open) {
+      log("tesla-log", "DataChannel이 열려 있지 않아 결과를 보내지 못했습니다.", "error");
+      return false;
+    }
+    var json;
+    try {
+      json = snapshotResults();
+    } catch (err) {
+      log("tesla-log", "결과 JSON을 만들지 못했습니다: " + err, "error");
+      return false;
+    }
+    var chunks = chunkUtf8(json, RESULT_CHUNK_BYTES);
+    var id = "r" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    for (var i = 0; i < chunks.length; i++) {
+      teslaSend({
+        t: "results",
+        id: id,
+        i: i,
+        n: chunks.length,
+        reason: reason || "manual",
+        chunk: chunks[i]
+      });
+    }
+    var hint = $("send-results-hint");
+    if (hint) hint.textContent = "PC로 보냈습니다. " + chunks.length + "조각, " + json.length + "자 (" + (reason || "manual") + ").";
+    log("tesla-log", "결과를 PC로 보냈습니다. " + chunks.length + "조각, " + json.length + "자 (" + (reason || "manual") + ")");
+    return true;
+  }
+
+  function sendTeslaResultsIfOpen(reason) {
+    if (teslaConn && teslaConn.open) return sendTeslaResults(reason);
+    return false;
+  }
+
+  function clearReceivedTesla() {
+    receivedTesla = null;
+    incomingResults = null;
+    var hint = $("pc-tesla-hint");
+    if (hint) hint.textContent = "아직 테슬라 결과가 없습니다.";
+    var list = $("pc-tesla-list");
+    if (list) list.innerHTML = "";
+    var pre = $("pc-tesla-json");
+    if (pre) {
+      pre.textContent = "";
+      pre.classList.add("hidden");
+    }
+  }
+
+  function renderReceivedTesla(obj, meta) {
+    var hint = $("pc-tesla-hint");
+    if (hint) {
+      hint.textContent = "수신함 · " + (meta.reason || "") + " · " + meta.chunks + "조각 · " + (meta.chars || 0) + "자";
+    }
+    var env = obj.env || {};
+    var sup = obj.support || {};
+    var codecs = obj.codecs || {};
+    var ice = obj.iceGathering || {};
+    var rows = [
+      ["수신", meta.reason || "-"],
+      ["화면", (env.innerWidth || "?") + "×" + (env.innerHeight || "?") + " / " + (env.screenWidth || "?") + "×" + (env.screenHeight || "?") + " dpr " + (env.devicePixelRatio || "?")],
+      ["WebRTC", sup.RTCPeerConnection ? "지원" : "없음", sup.RTCPeerConnection ? "ok-text" : "bad-text"],
+      ["DataChannel", sup.RTCDataChannel ? "지원" : "없음", sup.RTCDataChannel ? "ok-text" : "bad-text"],
+      ["H.264", codecs.h264 ? "있음" : "없음", codecs.h264 ? "ok-text" : "bad-text"],
+      ["ICE", "후보 " + (ice.candidateCount || 0) + " · host " + (ice.hasHost ? "있음" : "없음") + " · srflx " + (ice.hasSrflx ? "있음" : "없음")],
+      ["사설 IP", summarizePrivateIp(obj.privateIpTest)],
+      ["미디어", obj.media ? "있음" : "없음"],
+      ["탭", String((obj.taps || []).length) + "회"],
+      ["로그", String((obj.logs || []).length) + "줄"],
+      ["오류", (obj.errors && obj.errors.length) ? obj.errors.join(" | ") : "없음", (obj.errors && obj.errors.length) ? "warn-text" : "ok-text"]
+    ];
+    if ($("pc-tesla-list")) kv($("pc-tesla-list"), rows);
+    var pre = $("pc-tesla-json");
+    if (pre) {
+      pre.classList.remove("hidden");
+      pre.textContent = JSON.stringify(obj, null, 2);
+    }
+  }
+
+  function ingestTeslaResultChunk(msg) {
+    if (!msg || typeof msg.chunk !== "string") return;
+    var n = msg.n | 0;
+    var i = msg.i | 0;
+    if (n < 1 || n > 200 || i < 0 || i >= n) {
+      log("pc-log", "테슬라 결과 조각이 올바르지 않습니다.", "error");
+      return;
+    }
+    if (!incomingResults || incomingResults.id !== msg.id) {
+      incomingResults = { id: msg.id, n: n, parts: new Array(n), got: 0, reason: msg.reason };
+    }
+    if (incomingResults.parts[i] == null) {
+      incomingResults.parts[i] = msg.chunk;
+      incomingResults.got++;
+    }
+    if (incomingResults.got < incomingResults.n) return;
+    var json = incomingResults.parts.join("");
+    var reason = incomingResults.reason || msg.reason;
+    var chunks = incomingResults.n;
+    incomingResults = null;
+    var obj;
+    try {
+      obj = JSON.parse(json);
+    } catch (err) {
+      log("pc-log", "테슬라 결과 JSON 파싱 실패: " + err, "error");
+      return;
+    }
+    receivedTesla = obj;
+    log("pc-log", "테슬라 결과 수신 (" + (reason || "") + ", " + chunks + "조각, " + json.length + "자)");
+    renderReceivedTesla(obj, { reason: reason, chunks: chunks, chars: json.length });
+  }
+
+  function combinedResultsText() {
+    var pcObj;
+    try {
+      pcObj = JSON.parse(snapshotResults());
+    } catch (err) {
+      pcObj = { error: String(err) };
+    }
+    return JSON.stringify({ pc: pcObj, tesla: receivedTesla }, null, 2);
+  }
+
+  function downloadCombinedResults() {
+    var text = combinedResultsText();
+    var box = $("pc-json");
+    if (box) box.value = text;
+    var blob = new Blob([text], { type: "application/json" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    var stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    a.href = url;
+    a.download = "parkdesk-phase0-" + stamp + ".json";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1500);
+    log("pc-log", "합친 결과 JSON 파일을 저장했습니다.");
+  }
+
   async function statsFromPc(pc) {
     if (!pc || typeof pc.getStats !== "function") return null;
     var report = await pc.getStats(null);
@@ -568,6 +751,56 @@
     var summary = await gatherIce("tesla-log");
     renderIce(summary);
     log("tesla-log", "ICE 수집 완료. 후보 " + (summary.candidateCount || 0) + "개");
+    sendTeslaResultsIfOpen("tests-done");
+  }
+
+  function hideTeslaPhotoSummary() {
+    var card = $("tesla-photo");
+    if (card) card.classList.add("hidden");
+  }
+
+  function showTeslaPhotoSummary(reason) {
+    var card = $("tesla-photo");
+    var body = $("tesla-photo-body");
+    if (!card || !body) return;
+    var env = results.env || {};
+    var sup = results.support || {};
+    var codecs = results.codecs || {};
+    var ice = results.iceGathering || {};
+    var lines = [
+      ["실패", reason || "-"],
+      ["화면", (env.screenWidth || "?") + "×" + (env.screenHeight || "?")],
+      ["창", (env.innerWidth || "?") + "×" + (env.innerHeight || "?") + "  dpr " + (env.devicePixelRatio || "?")],
+      ["WebRTC", sup.RTCPeerConnection ? "지원" : "없음"],
+      ["Data", sup.RTCDataChannel ? "지원" : "없음"],
+      ["H.264", codecs.h264 ? "있음" : "없음"],
+      ["ICE", "후보 " + (ice.candidateCount != null ? ice.candidateCount : 0)
+        + " · host " + (ice.hasHost ? "있음" : "없음")
+        + " · srflx " + (ice.hasSrflx ? "있음" : "없음")
+        + " · mDNS " + (ice.hasMdns ? "있음" : "없음")],
+      ["사설IP", summarizePrivateIp(results.privateIpTest)]
+    ];
+    if (results.errors && results.errors.length) {
+      var errText = results.errors.slice(-2).join(" / ");
+      if (errText.length > 90) errText = errText.slice(0, 89) + "…";
+      lines.push(["오류", errText]);
+    }
+    body.innerHTML = "";
+    lines.forEach(function (row) {
+      var p = document.createElement("p");
+      p.className = "photo-line";
+      var k = document.createElement("span");
+      k.className = "photo-k";
+      k.textContent = row[0];
+      var v = document.createElement("span");
+      v.className = "photo-v";
+      v.textContent = row[1];
+      p.appendChild(k);
+      p.appendChild(v);
+      body.appendChild(p);
+    });
+    card.classList.remove("hidden");
+    try { card.scrollIntoView({ block: "nearest" }); } catch (e) {}
   }
 
   function teslaSend(obj) {
@@ -610,13 +843,26 @@
       teslaSend({ t: "hello_ok", env: results.env, codecs: results.codecs, ice: results.iceGathering });
       results.pairing = results.pairing || {};
       results.pairing.dataOpen = true;
+      setSendResultsEnabled(true);
+      hideTeslaPhotoSummary();
+      sendTeslaResults("channel-open");
     });
     conn.on("close", function () {
+      if (teslaConn !== conn) return;
       log("tesla-log", "DataChannel이 닫혔습니다.");
       setStatus("tesla-pair-status", "연결이 끊겼습니다", "bad");
+      setSendResultsEnabled(false);
+      if (!results.pairing || !results.pairing.dataOpen) {
+        showTeslaPhotoSummary("DataChannel이 열리기 전에 닫혔습니다");
+      }
     });
     conn.on("error", function (err) {
+      if (teslaConn !== conn) return;
       log("tesla-log", "DataChannel 오류: " + err, "error");
+      if (!results.pairing || !results.pairing.dataOpen) {
+        setStatus("tesla-pair-status", "연결 실패", "bad");
+        showTeslaPhotoSummary(String(err));
+      }
     });
   }
 
@@ -645,6 +891,9 @@
       rows.push(["손실/수신 패킷", (v.packetsLost || 0) + " / " + (v.packetsReceived || 0)]);
     }
     kv($("tesla-conn-list"), rows);
+    if (!liveTestSnapshotSent && (st.pairState === "succeeded" || st.nominated)) {
+      if (sendTeslaResultsIfOpen("tests-done")) liveTestSnapshotSent = true;
+    }
   }
 
   function teslaJoin(code) {
@@ -658,20 +907,25 @@
       return;
     }
     teslaLeave();
+    liveTestSnapshotSent = false;
+    hideTeslaPhotoSummary();
+    setSendResultsEnabled(false);
     var target = peerIdFromCode(code);
     results.pairing = { role: "tesla", code: code, target: target, broker: BROKER.host, startedAt: nowIso() };
     setStatus("tesla-pair-status", "브로커 접속 중…", "wait");
     log("tesla-log", "PeerJS 브로커 " + BROKER.host + " 에 연결하고 " + target + " 를 찾습니다.");
 
-    teslaPeer = peerOptions();
-    teslaPeer.on("open", function (id) {
+    var peer = peerOptions();
+    teslaPeer = peer;
+    peer.on("open", function (id) {
+      if (teslaPeer !== peer) return;
       log("tesla-log", "브로커에 연결됨. 내 ID=" + id);
       results.pairing.localPeerId = id;
       setStatus("tesla-pair-status", "브로커 연결됨. DataChannel/ICE 대기 중…", "wait");
       var conn = teslaPeer.connect(target, { reliable: true, metadata: { role: "tesla" } });
       wireTeslaData(conn);
     });
-    teslaPeer.on("call", function (call) {
+    peer.on("call", function (call) {
       teslaCall = call;
       log("tesla-log", "화면 공유 수신. 응답합니다.");
       call.answer();
@@ -692,12 +946,16 @@
       });
       call.on("error", function (err) { log("tesla-log", "call 오류: " + err, "error"); });
     });
-    teslaPeer.on("error", function (err) {
+    peer.on("error", function (err) {
+      if (teslaPeer !== peer) return;
       var msg = (err && err.type) ? (err.type + ": " + err) : String(err);
       log("tesla-log", "Peer 오류: " + msg, "error");
       setStatus("tesla-pair-status", "연결 실패: " + ((err && err.type) || msg), "bad");
+      setSendResultsEnabled(false);
+      showTeslaPhotoSummary((err && err.type) ? String(err.type) : String(err));
     });
-    teslaPeer.on("disconnected", function () {
+    peer.on("disconnected", function () {
+      if (teslaPeer !== peer) return;
       log("tesla-log", "브로커와 연결이 끊겼습니다.");
     });
 
@@ -713,6 +971,8 @@
     try { if (teslaCall) teslaCall.close(); } catch (e) {}
     try { if (teslaPeer) teslaPeer.destroy(); } catch (e) {}
     teslaConn = teslaCall = teslaPeer = null;
+    liveTestSnapshotSent = false;
+    setSendResultsEnabled(false);
     $("tesla-video").srcObject = null;
     $("tesla-video-empty").classList.remove("hidden");
   }
@@ -734,6 +994,7 @@
       var out = await runPrivateIpTest(ip);
       renderPrivate(out);
       log("tesla-log", "사설 IP 검사 완료");
+      sendTeslaResultsIfOpen("tests-done");
     });
     $("btn-join").addEventListener("click", function () { teslaJoin($("join-code").value); });
     $("join-code").addEventListener("keydown", function (e) {
@@ -745,6 +1006,9 @@
     });
     $("btn-copy-tesla").addEventListener("click", function () {
       copyText(snapshotResults(), "tesla-json", "tesla-log");
+    });
+    $("btn-send-results").addEventListener("click", function () {
+      sendTeslaResults("button");
     });
 
     var preset = new URLSearchParams(location.search).get("code");
@@ -832,6 +1096,7 @@
       if (!data || typeof data !== "object") return;
       if (data.t === "tap") showTap(data.x, data.y);
       if (data.t === "hello_ok") log("pc-log", "테슬라 hello_ok 수신");
+      if (data.t === "results") ingestTeslaResultChunk(data);
     });
     conn.on("close", function () {
       log("pc-log", "DataChannel이 닫혔습니다.");
@@ -899,6 +1164,7 @@
   }
 
   function startPcBroker(code) {
+    clearReceivedTesla();
     if (typeof Peer !== "function") {
       setStatus("pc-status", "PeerJS 로드 실패", "bad");
       log("pc-log", "window.Peer 가 없습니다.", "error");
@@ -1007,7 +1273,10 @@
     $("btn-share").addEventListener("click", function () { startShare(); });
     $("btn-stop-share").addEventListener("click", function () { stopShare(); });
     $("btn-copy-pc").addEventListener("click", function () {
-      copyText(snapshotResults(), "pc-json", "pc-log");
+      copyText(combinedResultsText(), "pc-json", "pc-log");
+    });
+    $("btn-download-pc").addEventListener("click", function () {
+      downloadCombinedResults();
     });
   }
 

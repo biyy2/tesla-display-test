@@ -241,3 +241,42 @@ video {
   box-shadow: 0 0 0 6px rgba(61, 184, 168, 0.25);
   pointer-events: none;
 }
+
+.btn-xl {
+  flex-basis: 100%;
+  min-height: 104px;
+  font-size: 32px;
+  font-weight: 700;
+}
+
+.photo-card {
+  background: #f4f7fb;
+  color: #12141a;
+  border: 4px solid #f4f7fb;
+}
+.photo-card h2 { color: #12141a; font-size: 32px; }
+.photo-lead {
+  color: #12141a;
+  font-size: 28px;
+  font-weight: 700;
+  margin: 0 0 16px;
+}
+.photo-line {
+  display: flex;
+  gap: 14px;
+  align-items: baseline;
+  margin: 0 0 10px;
+  line-height: 1.25;
+}
+.photo-k {
+  flex: 0 0 6.5rem;
+  color: #3a4658;
+  font-size: 24px;
+  font-weight: 700;
+}
+.photo-v {
+  flex: 1;
+  font-size: 32px;
+  font-weight: 700;
+  word-break: break-word;
+}
